@@ -10,6 +10,7 @@ import json
 import string
 import time
 from ast import literal_eval
+from itertools import combinations
 
 from d3m import container
 from d3m import utils
@@ -135,6 +136,8 @@ class DatamartQueryCursor(object):
                 search_res = timeout_call(timeout, self._search_datamart, [])
             elif self.search_query[self.current_searching_query_index].search_type == "vector":
                 search_res = timeout_call(timeout, self._search_vector, [])
+            elif self.search_query[self.current_searching_query_index].search_type == "geospatial":
+                search_res = timeout_call(timeout, self._search_geospatial_data, [])
             else:
                 raise ValueError("Unknown search query type for " +
                                  self.search_query[self.current_searching_query_index].search_type)
@@ -326,6 +329,7 @@ class DatamartQueryCursor(object):
         search_result = []
         variables_search = self.search_query[self.current_searching_query_index].variables_search
         keywords_search = self.search_query[self.current_searching_query_index].keywords_search
+        # COMMENT: title does not used, may delete later
         variables, title = dict(), dict()
         variables_temp = dict()  # this temp is specially used to store variable for time query
         for each_variable in self.search_query[self.current_searching_query_index].variables:
@@ -441,6 +445,123 @@ class DatamartQueryCursor(object):
         finally:
             return vector_results
 
+    def _search_geospatial_data(self) -> typing.List["DatamartSearchResult"]:
+        """
+        function used for searching geospatial data
+        :return: List[DatamartSearchResult]
+        """
+        self._logger.debug("Start searching geospatial data on wikidata and datamart...")
+        search_results = []
+
+        if type(self.supplied_data) is d3m_Dataset:
+            res_id, supplied_dataframe = d3m_utils.get_tabular_resource(dataset=self.supplied_data, resource_id=None)
+        else:
+            supplied_dataframe = self.supplied_data
+
+        # try to find possible columns of latitude and longitude
+        possible_longitude_or_latitude = []
+        for each in range(len(supplied_dataframe.columns)):
+            if type(self.supplied_data) is d3m_Dataset:
+                selector = (res_id, ALL_ELEMENTS, each)
+            else:
+                selector = (ALL_ELEMENTS, each)
+            each_column_meta = self.supplied_data.metadata.query(selector)
+
+            if "https://metadata.datadrivendiscovery.org/types/Location" in each_column_meta["semantic_types"]:
+                try:
+                    column_data = supplied_dataframe.iloc[:, each].astype(float).dropna()
+                    if max(column_data) <= config.max_longitude_val and min(column_data) >= config.min_longitude_val:
+                        possible_longitude_or_latitude.append(each)
+                    elif max(column_data) <= config.max_latitude_val and min(column_data) >= config.min_latitude_val:
+                        possible_longitude_or_latitude.append(each)
+                except:
+                    pass
+
+        if len(possible_longitude_or_latitude) < 2:
+            self._logger.debug("Supplied dataset does not have geospatial data!")
+            return search_results
+        else:
+            self._logger.debug("Finding columns:" + str(possible_longitude_or_latitude) + " which might be geospatial data columns...")
+
+        possible_la_or_long_comb = list(combinations(possible_longitude_or_latitude, 2))
+        for column_index_comb in possible_la_or_long_comb:
+            latitude_index, longitude_index = -1 , -1
+            # try to get the correct latitude and longitude pairs
+            for each_column_index in column_index_comb:
+                try:
+                    column_data = supplied_dataframe.iloc[:, each_column_index].astype(float).dropna()
+                    column_name = supplied_dataframe.columns[each_column_index]
+
+                    # must be longitude when its min is in [-180, -90), or max is in (90, 180]
+                    if config.max_latitude_val < max(column_data) <= config.max_longitude_val \
+                            or (config.min_latitude_val > min(column_data) >= config.min_longitude_val):
+                        longitude_index = each_column_index
+                    else:
+                        # determine the type by header [latitude, longitude]
+                        if any([True for i in column_name if i in ['a', 'A']]):
+                            latitude_index = each_column_index
+                        elif any([True for i in column_name if i in ['o', 'O', 'g', 'G']]):
+                            longitude_index = each_column_index
+
+                except Exception as e:
+                    self._logger.debug(e, exc_info=True)
+                    self._logger.error("Can't parse location information for column No." + str(each_column_index)
+                                           + " with column name " + column_name)
+
+            # search on datamart and wikidata by city qnodes
+            if latitude_index != -1 and longitude_index != -1:
+                self._logger.info("Latitude column is: " + str(latitude_index) + " and longitude is: " + str(longitude_index) + "...")
+                granularity = {'city'}
+                radius = 100
+
+                for gran in granularity:
+                    search_variables = {'metadata': {
+                        'search_result': {
+                            'latitude_index': latitude_index,
+                            'longitude_index': longitude_index,
+                            'radius': radius,
+                            'granularity': gran
+                        },
+                        'search_type': 'geospatial'
+                    }}
+                    # do wikidata query service to find city q-node columns
+                    return_ds = DownloadManager.query_geospatial_wikidata(self.supplied_data, search_variables, self.connection_url)
+                    _, return_df = d3m_utils.get_tabular_resource(dataset=return_ds, resource_id=None)
+
+                    if return_df.columns[-1].startswith('Geo_') and return_df.columns[-1].endswith('_wikidata'):
+                        qnodes = return_df.iloc[:, -1]
+                        qnodes_set = list(set(qnodes))
+                        coverage_score = len(qnodes_set)/len(qnodes)
+
+                        # search on datamart
+                        qnodes_str = " ".join(qnodes_set)
+                        variables = [VariableConstraint(key=return_df.columns[-1], values=qnodes_str)]
+                        self.search_query[self.current_searching_query_index].variables = variables
+                        search_res = timeout_call(1800, self._search_datamart, [])
+                        search_results.extend(search_res)
+
+                        # search on wikidata
+                        temp_q_nodes_columns = self.q_nodes_columns
+                        self.q_nodes_columns = [-1]
+                        search_res = timeout_call(1800, self._search_wikidata, [None, return_df])
+                        search_results.extend(search_res)
+                        self.q_nodes_columns = temp_q_nodes_columns
+
+        if search_results:
+            for each_result in search_results:
+                # change metadata's score
+                old_score = each_result.score()
+                new_score = old_score * coverage_score
+                each_result.metadata_manager.score = new_score
+                # change score in datamart_search_result
+                if "score" in each_result.search_result.keys():
+                    each_result.search_result["score"]["value"] = new_score
+
+            search_results.sort(key=lambda x: x.score(), reverse=True)
+
+        self._logger.debug("Running search on geospatial data finished.")
+        return search_results
+
 
 class Datamart(object):
     """
@@ -480,13 +601,13 @@ class Datamart(object):
         """
 
         return DatamartQueryCursor(augmenter=self.augmenter, search_query=[query], supplied_data=None,
-                                   connection_url=self.connection_url)
+                                   connection_url=self.connection_url, need_run_wikifier = False)
 
     def search_with_data(self, query: 'DatamartQuery', supplied_data: container.Dataset, need_wikidata=True) \
             -> DatamartQueryCursor:
         """
         Search using on a query and a supplied dataset.
-X
+
         This method is a "smart" search, which leaves the Datamart to determine how to evaluate the relevance of search
         result with regard to the supplied data. For example, a Datamart may try to identify named entities and date
         ranges in the supplied data and search for companion datasets which overlap.
@@ -517,7 +638,7 @@ X
             need_run_wikifier = False
         else:
             need_run_wikifier = None
-            search_queries = [DatamartQuery(search_type="wikidata"), DatamartQuery(search_type="vector")]
+            search_queries = [DatamartQuery(search_type="wikidata"), DatamartQuery(search_type="vector"), DatamartQuery(search_type="geospatial")]
 
         # try to update with more correct metadata if possible
         updated_result = MetadataCache.check_and_get_dataset_real_metadata(supplied_data)
@@ -615,7 +736,6 @@ X
         all_query_variables = []
         keywords = []
         translator = str.maketrans(string.punctuation, ' ' * len(string.punctuation))
-        possible_longitude_or_latitude = list()
 
         for each_constraint in data_constraints:
             for each_column in each_constraint.columns:
@@ -656,22 +776,6 @@ X
                     except Exception as e:
                         self._logger.debug(e, exc_info=True)
                         self._logger.error("Can't parse current datetime for column No." + str(each_column_index)
-                                           + " with column name " + supplied_data[each_column_res_id].columns[each_column_index])
-                        treat_as_a_text_column = True
-
-
-                # geospacial type data
-                elif "https://metadata.datadrivendiscovery.org/types/Location" in each_column_meta["semantic_types"]:
-                    try:
-                        column_data = supplied_data[each_column_res_id].iloc[:, each_column_index].astype(float).dropna()
-                        if max(column_data) <= config.max_longitude_val and min(column_data) >= config.min_longitude_val:
-                            possible_longitude_or_latitude.append(each_column_index)
-                        elif max(column_data) <= config.max_latitude_val and min(column_data) >= config.min_latitude_val:
-                            possible_longitude_or_latitude.append(each_column_index)
-
-                    except Exception as e:
-                        self._logger.debug(e, exc_info=True)
-                        self._logger.error("Can't parse location information for column No." + str(each_column_index)
                                            + " with column name " + supplied_data[each_column_res_id].columns[each_column_index])
                         treat_as_a_text_column = True
 
@@ -1042,7 +1146,7 @@ class DatamartSearchResult:
         """
         self._logger.debug("Start running wikifier.")
         # here because this part's code if for augment, we already have cache for that
-        results = d3m_wikifier.run_wikifier(supplied_data=supplied_data, use_cache=False)
+        results = d3m_wikifier.run_wikifier(supplied_data=supplied_data, use_cache=True)
         self._logger.debug("Running wikifier finished.")
         return results
 
@@ -1095,8 +1199,11 @@ class DatamartSearchResult:
                                                                        search_result_serialized=self.serialize())
             cache_result = self.general_search_cache_manager.get_cache_results(cache_key)
             if cache_result is not None:
+                if type(cache_result) is string and cache_result == "failed":
+                    self._logger.warning("This augment was failed last time!")
                 self._logger.info("Using caching results")
                 return cache_result
+
         except Exception as e:
             cache_key = None
             self._logger.error("Some error happened when getting results from cache!")
@@ -1104,24 +1211,37 @@ class DatamartSearchResult:
 
         self._logger.info("Cache not hit, start running augment.")
 
-        if self.search_type == "wikifier":
-            res = self._run_wikifier(supplied_data)
+        try:
+            if self.search_type == "wikifier":
+                res = timeout_call(1800, self._run_wikifier, [supplied_data])
+                # res = self._run_wikifier(supplied_data)
 
-        else:
-            if type(supplied_data) is d3m_DataFrame:
-                res = self._augment(supplied_data=supplied_data, augment_columns=augment_columns, generate_metadata=True,
-                                    return_format="df", augment_resource_id=augment_resource_id)
-            elif type(supplied_data) is d3m_Dataset:
-                res = self._augment(supplied_data=supplied_data, augment_columns=augment_columns, generate_metadata=True,
-                                    return_format="ds", augment_resource_id=augment_resource_id)
             else:
-                raise ValueError("Unknown input type for supplied data as: " + str(type(supplied_data)))
+                if type(supplied_data) is d3m_DataFrame:
+                    res = timeout_call(1800, self._augment, [supplied_data, augment_columns, True, "df", augment_resource_id])
 
-        # sometime the index will be not continuous after augment, need to reset to ensure the index is continuous
-            res[augment_resource_id].reset_index(drop=True)
+                    # res = self._augment(supplied_data=supplied_data, augment_columns=augment_columns, generate_metadata=True,
+                    #                     return_format="df", augment_resource_id=augment_resource_id)
+                elif type(supplied_data) is d3m_Dataset:
+                    res = timeout_call(1800, self._augment, [supplied_data, augment_columns, True, "ds", augment_resource_id])
+                    # res = self._augment(supplied_data=supplied_data, augment_columns=augment_columns, generate_metadata=True,
+                    #                     return_format="ds", augment_resource_id=augment_resource_id)
+                else:
+                    raise ValueError("Unknown input type for supplied data as: " + str(type(supplied_data)))
 
-        res[augment_resource_id].fillna('', inplace=True)
-        res[augment_resource_id] = res[augment_resource_id].astype(str)
+            if res is not None:
+                # sometime the index will be not continuous after augment, need to reset to ensure the index is continuous
+                res[augment_resource_id].reset_index(drop=True)
+
+                res[augment_resource_id].fillna('', inplace=True)
+                res[augment_resource_id] = res[augment_resource_id].astype(str)
+            else:
+                res = "failed"
+
+        except Exception as e:
+            self._logger.error("Augment failed!")
+            self._logger.debug(e, exc_info=True)
+            res = "failed"
 
         # should not cache wikifier results here, as we already cached it in wikifier part
         # and we don't know if the wikifier success or not here
@@ -1132,7 +1252,8 @@ class DatamartSearchResult:
                                                                          hash_key=cache_key
                                                                          )
             # save the augmented result's metadata if second augment is conducted
-            MetadataCache.save_metadata_from_dataset(res)
+            if type(res) is not string and res != "failed":
+                MetadataCache.save_metadata_from_dataset(res)
             if not response:
                 self._logger.warning("Push augment results to results failed!")
             else:

@@ -16,11 +16,10 @@ from datamart_isi import config
 from datamart_isi.cache.general_search_cache import GeneralSearchCache
 
 DEFAULT_DATAMART_URL = config.default_datamart_url
-CACHE_MANAGER = GeneralSearchCache(connection_url= os.getenv('DATAMART_URL_NYU', DEFAULT_DATAMART_URL))
+CACHE_MANAGER = GeneralSearchCache(connection_url=os.getenv('DATAMART_URL_NYU', DEFAULT_DATAMART_URL))
 
 try:
     from datamart_isi.config import default_temp_path
-
     DEFAULT_TEMP_PATH = default_temp_path
 except:
     DEFAULT_TEMP_PATH = "/tmp"
@@ -38,11 +37,16 @@ def produce(inputs, target_columns: typing.List[int] = None, target_p_nodes: typ
 
         if use_cache:
             cache_key = CACHE_MANAGER.get_hash_key(inputs, json.dumps(produce_config))
+            _logger.debug("Current wikification's key is " + cache_key)
             cache_result = CACHE_MANAGER.get_cache_results(cache_key)
             if cache_result is not None:
                 _logger.info("Using caching results for wikifier")
                 return cache_result
             # END cache part
+            else:
+                _logger.debug("Cache not hitted.")
+        else:
+            _logger.debug("Not use cache for this time's wikification.")
 
         if wikifier_choice is None:
             # FIXME: Currently the new wikifier maybe very slow for large datasets
@@ -230,11 +234,12 @@ def produce_by_new_wikifier(input_df, target_columns=None, target_p_nodes: dict 
     The function used to call new wikifier service
     :param input_df: a dataframe(both d3m or pandas are acceptable)
     :param target_columns: typing.List[int] indicates the column numbers of the columns need to be wikified
+    :param target_p_nodes: user-speicified Q node want to get, can be None if want automatic search
     :param threshold_for_coverage: the minimum coverage of Q nodes for the column,
                                    if the appeared times are lower than threshold, we will not use it
     :return: a dataframe with wikifiered columns
     """
-    _logger.debug("Start running new wikifier")
+    _logger.info("Start running new wikifier")
     if target_columns is None:
         target_columns = list(range(input_df.shape[1]))
 
@@ -293,7 +298,7 @@ def produce_by_new_wikifier(input_df, target_columns=None, target_p_nodes: dict 
                 return_df.rename(columns={cn: new_name}, inplace=True)
         _logger.debug("Get data from the new wikifier successfully.")
         if column_to_p_node_dict:
-            _logger.debug("For each column, the best matching class is:" + str(column_to_p_node_dict))
+            _logger.info("For each column, the best matching class is:" + str(column_to_p_node_dict))
             save_specific_p_nodes(input_df, column_to_p_node_dict)
     else:
         _logger.error('Something wrong in new wikifier server with response code: ' + response.text)
@@ -303,8 +308,7 @@ def produce_by_new_wikifier(input_df, target_columns=None, target_p_nodes: dict 
     return return_df
 
 
-def produce_by_automatic(input_df, target_columns=None, target_p_nodes=None,
-                         threshold_for_coverage=0.7) -> pd.DataFrame:
+def produce_by_automatic(input_df, target_columns=None, target_p_nodes=None,threshold_for_coverage=0.7) -> pd.DataFrame:
     """
     The function used to call new wikifier service
     :param input_df: a dataframe(both d3m or pandas are acceptable)

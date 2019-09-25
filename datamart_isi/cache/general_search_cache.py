@@ -75,7 +75,19 @@ class GeneralSearchCache(object):
             else:
                 raise ValueError("Unsupport type of supplied_data result as " + str(type(supplied_dataframe)) + "!")
 
-            path_to_augment_results = os.path.join(config.cache_file_storage_base_loc, hash_key + ".pkl")
+            # add supplied data for further updating if needed
+            try:
+                search_result_json = json.loads(search_result_serialized)
+                if "wikifier_choice" in search_result_json:
+                    storage_loc = os.path.join(config.cache_file_storage_base_loc, "wikifier_cache")
+                else:
+                    storage_loc = os.path.join(config.cache_file_storage_base_loc, "general_search_cache")
+            except:
+                storage_loc = os.path.join(config.cache_file_storage_base_loc, "other_cache")
+
+            path_to_supplied_dataframe = os.path.join(storage_loc, str(hash_supplied_dataframe) + ".pkl")
+            path_to_augment_results = os.path.join(storage_loc, hash_key + ".pkl")
+
             with open(path_to_augment_results, "wb") as f:
                 pickle.dump(augment_results, f)
 
@@ -88,18 +100,6 @@ class GeneralSearchCache(object):
             if not response_code2:
                 self._logger.warning("Pushing timestamp failed! What happened???")
 
-            # add supplied data for further updating if needed
-            if search_result_serialized:
-                try:
-                    search_result_json = json.loads(search_result_serialized)
-                    if "wikifier_choice" in search_result_json:
-                        storage_loc = os.path.join(config.cache_file_storage_base_loc, "wikifier_cache")
-                    else:
-                        storage_loc = os.path.join(config.cache_file_storage_base_loc, "general_search_cache")
-                except:
-                    storage_loc = os.path.join(config.cache_file_storage_base_loc, "other_cache")
-
-            path_to_supplied_dataframe = os.path.join(storage_loc, str(hash_supplied_dataframe) + ".pkl")
             with open(path_to_supplied_dataframe, "wb") as f:
                 pickle.dump(supplied_dataframe, f)
             response_code3 = self.mc.set("supplied_data" + hash_key, path_to_supplied_dataframe)

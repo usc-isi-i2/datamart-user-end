@@ -11,6 +11,8 @@ from datamart_isi.joiners.join_result import JoinResult
 from datamart_isi.utilities import connection
 from SPARQLWrapper import SPARQLWrapper, JSON, POST, URLENCODED
 from itertools import chain
+from datamart_isi.utilities.geospatial_related import GeospatialRelated
+from datamart_isi.cache.wikidata_cache import QueryCache
 
 
 class Augment(object):
@@ -31,6 +33,7 @@ class Augment(object):
         self.qm.setRequestMethod(URLENCODED)
         self.profiler = Profiler()
         self.logger = logging.getLogger(__name__)
+        self.wikidata_cache_manager = QueryCache(connection_url=endpoint)
 
     def query_by_sparql(self, query: dict, dataset: pd.DataFrame = None) -> typing.Optional[typing.List[dict]]:
         """
@@ -115,11 +118,11 @@ class Augment(object):
         if "variables_search" in json_query.keys() and json_query["variables_search"] != {}:
             if "temporal_variable" in json_query["variables_search"].keys():
                 tv = json_query["variables_search"]["temporal_variable"]
-                TemporalGranularity = {'second': 14, 'minute': 13, 'hour': 12, 'day': 11, 'month': 10, 'year': 9}
+                temporal_granularity = {'second': 14, 'minute': 13, 'hour': 12, 'day': 11, 'month': 10, 'year': 9}
 
                 start_date = pd.to_datetime(tv["start"]).isoformat()
                 end_date = pd.to_datetime(tv["end"]).isoformat()
-                granularity = TemporalGranularity[tv["granularity"]]
+                granularity = temporal_granularity[tv["granularity"]]
                 spaqrl_query += '''
                     ?variable pq:C2013 ?time_granularity . 
                     ?variable pq:C2011 ?start_time .
@@ -127,6 +130,21 @@ class Augment(object):
                     FILTER(?time_granularity >= ''' + str(granularity) + ''') 
                     FILTER(!((?start_time > "''' + end_date + '''"^^xsd:dateTime) || (?end_time < "''' + start_date + '''"^^xsd:dateTime)))
                     '''
+
+            if "geospatial_variable" in json_query["variables_search"].keys():
+                geo_variable = json_query["variables_search"]["geospatial_variable"]
+                qnodes = self.parse_geospatial_query(geo_variable)
+                if qnodes:
+                    # find similar dataset from datamart
+                    query_part = " ".join(qnodes)
+                    # query_part = "q1494 q1400 q759 q1649 q1522 q1387 q16551" # COMMENT: for testing
+                    spaqrl_query += '''
+                                        ?variable pq:C2006 [
+                                            bds:search """''' + query_part + '''""" ;
+                                            bds:relevance ?score_geo ;
+                                        ].
+                                     '''
+                    bind = "?score_geo" if bind == "" else bind + "+ ?score_geo"
 
         # if "title_search" in json_query.keys() and json_query["title_search"] != '':
         #     query_title = json_query["title_search"]
@@ -143,6 +161,40 @@ class Augment(object):
         spaqrl_query += "\n }" + "\n" + ORDER + "\n" + LIMIT
 
         return spaqrl_query
+
+    def parse_geospatial_query(self, geo_variable):
+        geo_gra_dict = {'country': 'Q6256', 'state': 'Q7275', 'city': 'Q515', 'county': 'Q28575',
+                        'postal_code': 'Q37447'}
+        qnodes = set()
+
+        # located inside a bounding box
+        if "latitude1" in geo_variable.keys() and "latitude2" in geo_variable.keys():
+            geo1_related = GeospatialRelated(float(geo_variable["latitude1"]), float(geo_variable["longitude1"]))
+            geo1_related.coordinate_transform()  # axis transformation
+            geo2_related = GeospatialRelated(float(geo_variable["latitude2"]), float(geo_variable["longitude2"]))
+            geo2_related.coordinate_transform()
+            # find top left point and bottom right point
+            top_left_point, botm_right_point = geo1_related.distinguish_two_points(geo2_related)
+            granularity = geo_gra_dict[geo_variable["granularity"]]
+
+            if top_left_point and botm_right_point:
+                # get Q nodes located inside a geospatial bounding box from wikidata query
+                sparql_query = "select distinct ?place where \n{\n  ?place wdt:P31/wdt:P279* wd:" + granularity + " .\n" \
+                               + "SERVICE wikibase:box {\n ?place wdt:P625 ?location .\n" \
+                               + "bd:serviceParam wikibase:cornerWest " + "\"Point(" + str(
+                    top_left_point[0]) + " " + str(top_left_point[1]) + ")\"^^geo:wktLiteral .\n" \
+                               + "bd:serviceParam wikibase:cornerEast " + "\"Point(" + str(
+                    botm_right_point[0]) + " " + str(botm_right_point[1]) + ")\"^^geo:wktLiteral .\n}\n" \
+                               + "SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\" }\n}\n"
+                results = self.wikidata_cache_manager.get_result(sparql_query)
+                if results:
+                    for each in results:
+                        value = each["place"]["value"]
+                        value = value.split('/')[-1]
+                        qnodes.add(value)
+
+        return qnodes
+
     #
     # def query(self,
     #           col: pd.Series = None,

@@ -18,7 +18,7 @@ cache_file_storage_base_loc = os.path.join(home_dir, "memcache_storage")
 
 wikidata_server_suffix = ":8888/bigdata/namespace/wdq/sparql"
 memcache_server_suffix = ":11211"
-wikifier_server_suffix = ":4444/get_identifiers"
+wikifier_server_suffix = ":9000/get_identifiers"
 general_search_server_suffix = ":9002/blazegraph/namespace/datamart3/sparql"
 general_search_test_server_suffix = ":9002/blazegraph/namespace/datamart4/sparql"
 rest_api_suffix = ":9000"
